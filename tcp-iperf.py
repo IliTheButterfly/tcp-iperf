@@ -35,11 +35,70 @@ def verify_message(payload: bytes, expected_crc: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Reporting helpers
+# Formatting helpers
 # ---------------------------------------------------------------------------
 
-def kbps(byte_count: float, elapsed: float) -> float:
-    return (byte_count * 8) / (elapsed * 1e3) if elapsed > 0 else 0.0
+def fmt_bitrate(bits_per_sec: float) -> str:
+    """Return a human-readable bitrate string, auto-scaled to bps/Kbps/Mbps/Gbps."""
+    if bits_per_sec >= 1e9:
+        return f"{bits_per_sec / 1e9:.2f} Gbps"
+    if bits_per_sec >= 1e6:
+        return f"{bits_per_sec / 1e6:.2f} Mbps"
+    if bits_per_sec >= 1e3:
+        return f"{bits_per_sec / 1e3:.2f} Kbps"
+    return f"{bits_per_sec:.0f} bps"
+
+
+def fmt_bytes(byte_count: float) -> str:
+    """Return a human-readable data volume string, auto-scaled to B/KB/MB/GB."""
+    if byte_count >= 1e9:
+        return f"{byte_count / 1e9:.2f} GB"
+    if byte_count >= 1e6:
+        return f"{byte_count / 1e6:.2f} MB"
+    if byte_count >= 1e3:
+        return f"{byte_count / 1e3:.2f} KB"
+    return f"{byte_count:.0f} B"
+
+
+def bitrate(byte_count: float, elapsed: float) -> float:
+    """Return bits per second."""
+    return (byte_count * 8) / elapsed if elapsed > 0 else 0.0
+
+
+def parse_rate(value: str) -> float:
+    """Parse a human-friendly bitrate string into bits per second.
+
+    Accepts plain numbers or a number followed by a suffix (case-insensitive):
+      k / kbps  → Kbps  (×1 000)
+      m / mbps  → Mbps  (×1 000 000)
+      g / gbps  → Gbps  (×1 000 000 000)
+
+    Examples: '500', '2k', '100m', '1.5g', '100mbps'
+    Raises argparse.ArgumentTypeError on bad input.
+    """
+    s = value.strip().lower()
+    suffixes = {
+        "gbps": 1e9, "g": 1e9,
+        "mbps": 1e6, "m": 1e6,
+        "kbps": 1e3, "k": 1e3,
+    }
+    for suffix, multiplier in suffixes.items():
+        if s.endswith(suffix):
+            numeric = s[: -len(suffix)]
+            break
+    else:
+        numeric = s
+        multiplier = 1.0
+
+    try:
+        return float(numeric) * multiplier
+    except ValueError:
+        import argparse as _ap
+        raise _ap.ArgumentTypeError(
+            f"Invalid rate '{value}'. "
+            "Use a number with an optional suffix: k/m/g or kbps/mbps/gbps "
+            "(e.g. 2k, 100m, 1.5g, 500mbps)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +148,9 @@ def _tcp_recv_session(conn, bufsize: int, interval: int, integrity: bool):
                 now = time.time()
                 if now - last_time >= interval:
                     interval_bytes = total_bytes - last_bytes
+                    elapsed_interval = now - last_time
                     print(f"[TCP][{now - start_time:.1f}s] "
-                          f"{kbps(interval_bytes, now - last_time):.2f} Kbps")
+                          f"{fmt_bitrate(bitrate(interval_bytes, elapsed_interval))}")
                     last_time = now
                     last_bytes = total_bytes
         else:
@@ -103,21 +163,21 @@ def _tcp_recv_session(conn, bufsize: int, interval: int, integrity: bool):
                 now = time.time()
                 if now - last_time >= interval:
                     interval_bytes = total_bytes - last_bytes
+                    elapsed_interval = now - last_time
                     print(f"[TCP][{now - start_time:.1f}s] "
-                          f"{kbps(interval_bytes, now - last_time):.2f} Kbps")
+                          f"{fmt_bitrate(bitrate(interval_bytes, elapsed_interval))}")
                     last_time = now
                     last_bytes = total_bytes
 
     elapsed = time.time() - start_time
-    print(f"[TCP] Session: {total_bytes/1e3:.2f} KB in {elapsed:.2f}s "
-          f"({kbps(total_bytes, elapsed):.2f} Kbps)"
+    print(f"[TCP] Session: {fmt_bytes(total_bytes)} in {elapsed:.2f}s "
+          f"({fmt_bitrate(bitrate(total_bytes, elapsed))})"
           + (f" | corrupt={corrupt}" if integrity else ""))
 
 
 def tcp_server(host: str, port: int, bufsize: int, interval: int,
                as_client: bool, integrity: bool):
     if as_client:
-        # Single outbound connection — behave as before
         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         conn.connect((host, port))
         print(f"[TCP] Connected to upstream server at {host}:{port}")
@@ -145,12 +205,13 @@ def tcp_server(host: str, port: int, bufsize: int, interval: int,
         s.close()
 
 
-def tcp_client(host: str, port: int, bufsize: int, duration: int,
-               integrity: bool):
-    payload = b"x" * bufsize
+def tcp_client(host: str, port: int, pktsize: int, bufsize: int,
+               duration: int, integrity: bool):
+    payload = b"x" * pktsize
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((host, port))
         print(f"[TCP] Connected to {host}:{port}"
+              + f" | pktsize={fmt_bytes(pktsize)}"
               + (" (integrity on)" if integrity else ""))
         start_time = time.time()
         sent_bytes = 0
@@ -164,8 +225,8 @@ def tcp_client(host: str, port: int, bufsize: int, duration: int,
             sent_bytes += len(payload)
 
     elapsed = time.time() - start_time
-    print(f"[TCP] Sent {sent_bytes/1e3:.2f} KB in {elapsed:.2f}s "
-          f"({kbps(sent_bytes, elapsed):.2f} Kbps)")
+    print(f"[TCP] Sent {fmt_bytes(sent_bytes)} in {elapsed:.2f}s "
+          f"({fmt_bitrate(bitrate(sent_bytes, elapsed))})")
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +242,8 @@ def udp_server(host: str, port: int, bufsize: int, interval: int,
     s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, target_rcvbuf)
     actual_rcvbuf = s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
     if actual_rcvbuf < target_rcvbuf:
-        print(f"[UDP] WARNING: SO_RCVBUF is {actual_rcvbuf // 1024} KB "
-              f"(wanted {target_rcvbuf // 1024} KB). "
+        print(f"[UDP] WARNING: SO_RCVBUF is {fmt_bytes(actual_rcvbuf)} "
+              f"(wanted {fmt_bytes(target_rcvbuf)}). "
               f"Raise net.core.rmem_max to reduce kernel-level drops.")
 
     s.bind((host, port))
@@ -200,8 +261,9 @@ def udp_server(host: str, port: int, bufsize: int, interval: int,
         if ss["start_time"] is None:
             return
         elapsed = time.time() - ss["start_time"]
-        print(f"[UDP] Session: {ss['total_bytes']/1e3:.2f} KB in {elapsed:.2f}s "
-              f"({kbps(ss['total_bytes'], elapsed):.2f} Kbps) | pkts={ss['pkt_count']}"
+        print(f"[UDP] Session: {fmt_bytes(ss['total_bytes'])} in {elapsed:.2f}s "
+              f"({fmt_bitrate(bitrate(ss['total_bytes'], elapsed))}) "
+              f"| pkts={ss['pkt_count']}"
               + (f" lost={ss['lost']} ooo={ss['out_of_order']} corrupt={ss['corrupt']}"
                  if integrity else ""))
 
@@ -213,11 +275,9 @@ def udp_server(host: str, port: int, bufsize: int, interval: int,
                 data, addr = s.recvfrom(bufsize + HEADER_SIZE + 64)
             except socket.timeout:
                 if ss["start_time"] is not None:
-                    # Activity was happening — print report and reset for next session
                     print_summary(ss)
                     ss = reset_session()
                     print(f"[UDP] Idle — waiting for next session...")
-                # else: still idle before first packet, just keep waiting
                 continue
 
             now = time.time()
@@ -260,8 +320,9 @@ def udp_server(host: str, port: int, bufsize: int, interval: int,
 
             if now - ss["last_time"] >= interval:
                 interval_bytes = ss["total_bytes"] - ss["last_bytes"]
+                elapsed_interval = now - ss["last_time"]
                 print(f"[UDP][{now - ss['start_time']:.1f}s] "
-                      f"{kbps(interval_bytes, now - ss['last_time']):.2f} Kbps"
+                      f"{fmt_bitrate(bitrate(interval_bytes, elapsed_interval))}"
                       + (f" | lost={ss['lost']} ooo={ss['out_of_order']} corrupt={ss['corrupt']}"
                          if integrity else ""))
                 ss["last_time"] = now
@@ -274,49 +335,44 @@ def udp_server(host: str, port: int, bufsize: int, interval: int,
         s.close()
 
 
-def udp_client(host: str, port: int, bufsize: int, duration: int,
-               integrity: bool, rate_kbps: float = 0):
+def udp_client(host: str, port: int, pktsize: int, bufsize: int,
+               duration: int, integrity: bool, rate_bps: float = 0):
     """Send UDP datagrams.
 
-    rate_kbps: target send rate in Kbps (0 = unlimited).  The pacing is
-    done by tracking a token budget; no sleep is inserted when we're already
-    behind target, so the actual rate can be slightly below target on slow
-    systems but will never exceed it on average.
+    rate_bps: target send rate in bits per second (0 = unlimited). Pacing is
+    done by tracking when the next datagram is due; no sleep if already behind.
     """
-    payload = b"x" * bufsize
-    # bytes per second budget (0 = unlimited)
-    rate_bps = (rate_kbps * 1e3) / 8 if rate_kbps > 0 else 0
+    payload = b"x" * pktsize
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         print(f"[UDP] Sending to {host}:{port}"
+              + f" | pktsize={fmt_bytes(pktsize)}"
               + (" (integrity on)" if integrity else "")
-              + (f" @ {rate_kbps:.0f} Kbps" if rate_kbps > 0 else " (unlimited)"))
+              + (f" @ {fmt_bitrate(rate_bps)}" if rate_bps > 0 else " (unlimited)"))
         start_time = time.time()
         sent_bytes = 0
         seq = 0
-        next_send_time = start_time  # for pacing
+        next_send_time = start_time
 
         while time.time() - start_time < duration:
-            # Pacing: if we have a rate limit, wait until the token is due
             if rate_bps > 0:
                 now = time.time()
                 if now < next_send_time:
                     time.sleep(next_send_time - now)
-                dgram_size = len(payload) + (HEADER_SIZE if integrity else 0)
-                next_send_time += dgram_size / rate_bps
+                dgram_size = pktsize + (HEADER_SIZE if integrity else 0)
+                next_send_time += dgram_size / (rate_bps / 8)
 
             if integrity:
                 dgram = encode_message(payload, seq)
                 s.sendto(dgram, (host, port))
-                seq += 1
             else:
                 s.sendto(payload, (host, port))
-                seq += 1
-            sent_bytes += len(payload)
+            seq += 1
+            sent_bytes += pktsize
 
     elapsed = time.time() - start_time
-    print(f"[UDP] Sent {sent_bytes/1e3:.2f} KB in {elapsed:.2f}s "
-          f"({kbps(sent_bytes, elapsed):.2f} Kbps) | pkts={seq}")
+    print(f"[UDP] Sent {fmt_bytes(sent_bytes)} in {elapsed:.2f}s "
+          f"({fmt_bitrate(bitrate(sent_bytes, elapsed))}) | pkts={seq}")
 
 
 # ---------------------------------------------------------------------------
@@ -328,8 +384,8 @@ def add_common_server_args(p):
                    help="Bind address (default: 0.0.0.0)")
     p.add_argument("-p", "--port", type=int, default=5001,
                    help="Port (default: 5001)")
-    p.add_argument("-b", "--bufsize", type=int, default=64 * 1024,
-                   help="Buffer / chunk size in bytes (default: 65536)")
+    p.add_argument("-b", "--bufsize", type=int, default=256 * 1024,
+                   help="Socket read buffer size in bytes (default: 262144)")
     p.add_argument("-i", "--interval", type=int, default=1,
                    help="Reporting interval in seconds (default: 1)")
     p.add_argument("-I", "--integrity", action="store_true",
@@ -340,8 +396,10 @@ def add_common_client_args(p):
     p.add_argument("host", help="Server hostname or IP")
     p.add_argument("-p", "--port", type=int, default=5001,
                    help="Port (default: 5001)")
-    p.add_argument("-b", "--bufsize", type=int, default=64 * 1024,
-                   help="Payload size per send in bytes (default: 65536)")
+    p.add_argument("-s", "--pktsize", type=int, default=1400,
+                   help="Payload size per packet/send in bytes (default: 1400)")
+    p.add_argument("-b", "--bufsize", type=int, default=256 * 1024,
+                   help="Socket send buffer size in bytes (default: 262144)")
     p.add_argument("-t", "--time", type=int, default=10,
                    help="Test duration in seconds (default: 10)")
     p.add_argument("-I", "--integrity", action="store_true",
@@ -357,14 +415,14 @@ Examples:
   # TCP server
   %(prog)s tcp server
 
-  # TCP client sending for 10s
-  %(prog)s tcp client 192.168.1.5
+  # TCP client, 64 KB chunks, 10s
+  %(prog)s tcp client 192.168.1.5 -s 65536
 
   # UDP server with integrity checking
   %(prog)s udp server -I
 
-  # UDP client with integrity checking, 30s, 8 KB datagrams
-  %(prog)s udp client 192.168.1.5 -I -t 30 -b 8192
+  # UDP client, 1400-byte datagrams, rate-limited to 100 Mbps
+  %(prog)s udp client 192.168.1.5 -I -s 1400 -r 100m
 """)
 
     sub = parser.add_subparsers(dest="proto", required=True,
@@ -394,9 +452,11 @@ Examples:
 
     udp_cli = udp_sub.add_parser("client", help="UDP client (sender)")
     add_common_client_args(udp_cli)
-    udp_cli.add_argument("-r", "--rate", type=float, default=0,
-                         metavar="KBPS",
-                         help="Target send rate in Kbps (default: unlimited). "
+    udp_cli.add_argument("-r", "--rate", type=parse_rate, default=0,
+                         metavar="RATE",
+                         help="Target send rate (default: unlimited). "
+                              "Accepts a number with an optional suffix: "
+                              "k/kbps, m/mbps, g/gbps — e.g. 2k, 100m, 1.5g. "
                               "Use this to avoid flooding the receiver's "
                               "kernel buffer and causing false packet loss.")
 
@@ -407,15 +467,15 @@ Examples:
             tcp_server(args.host, args.port, args.bufsize, args.interval,
                        args.as_client, args.integrity)
         else:
-            tcp_client(args.host, args.port, args.bufsize, args.time,
-                       args.integrity)
+            tcp_client(args.host, args.port, args.pktsize, args.bufsize,
+                       args.time, args.integrity)
     else:  # udp
         if args.role == "server":
             udp_server(args.host, args.port, args.bufsize, args.interval,
                        args.integrity)
         else:
-            udp_client(args.host, args.port, args.bufsize, args.time,
-                       args.integrity, args.rate)
+            udp_client(args.host, args.port, args.pktsize, args.bufsize,
+                       args.time, args.integrity, args.rate)
 
 
 if __name__ == "__main__":
