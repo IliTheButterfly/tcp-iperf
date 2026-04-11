@@ -336,16 +336,21 @@ def udp_server(host: str, port: int, bufsize: int, interval: int,
 
 
 def udp_client(host: str, port: int, pktsize: int, bufsize: int,
-               duration: int, integrity: bool, rate_bps: float = 0):
+               duration: int, integrity: bool, rate_bps: float = 0,
+               bind_port: int = 0):
     """Send UDP datagrams.
 
     rate_bps: target send rate in bits per second (0 = unlimited). Pacing is
     done by tracking when the next datagram is due; no sleep if already behind.
+    bind_port: source port to bind to (0 = let the OS pick).
     """
     payload = b"x" * pktsize
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("", bind_port))
+        actual_src_port = s.getsockname()[1]
         print(f"[UDP] Sending to {host}:{port}"
+              + f" (src port {actual_src_port})"
               + f" | pktsize={fmt_bytes(pktsize)}"
               + (" (integrity on)" if integrity else "")
               + (f" @ {fmt_bitrate(rate_bps)}" if rate_bps > 0 else " (unlimited)"))
@@ -459,6 +464,10 @@ Examples:
                               "k/kbps, m/mbps, g/gbps — e.g. 2k, 100m, 1.5g. "
                               "Use this to avoid flooding the receiver's "
                               "kernel buffer and causing false packet loss.")
+    udp_cli.add_argument("-B", "--bind-port", type=int, default=0,
+                         metavar="PORT",
+                         help="Source port to bind before sending "
+                              "(default: 0, OS picks an ephemeral port)")
 
     args = parser.parse_args()
 
@@ -475,7 +484,7 @@ Examples:
                        args.integrity)
         else:
             udp_client(args.host, args.port, args.pktsize, args.bufsize,
-                       args.time, args.integrity, args.rate)
+                       args.time, args.integrity, args.rate, args.bind_port)
 
 
 if __name__ == "__main__":

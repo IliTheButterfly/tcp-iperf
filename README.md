@@ -87,7 +87,7 @@ The server requests a 64 MB socket receive buffer (`SO_RCVBUF`) on startup. If t
 ### Client
 
 ```
-python netperf.py udp client <HOST> [-p PORT] [-s PKTSIZE] [-b BUFSIZE] [-t TIME] [-I] [-r RATE]
+python netperf.py udp client <HOST> [-p PORT] [-s PKTSIZE] [-b BUFSIZE] [-t TIME] [-I] [-r RATE] [-B PORT]
 ```
 
 | Flag | Default | Description |
@@ -99,6 +99,7 @@ python netperf.py udp client <HOST> [-p PORT] [-s PKTSIZE] [-b BUFSIZE] [-t TIME
 | `-t`, `--time` | `10` | Test duration in seconds |
 | `-I`, `--integrity` | off | Enable length prefix + CRC32 framing |
 | `-r`, `--rate` | unlimited | Target send rate — see rate syntax below |
+| `-B`, `--bind-port` | `0` (OS picks) | Source port to bind before sending |
 
 ### Rate syntax (`-r`)
 
@@ -131,6 +132,9 @@ python netperf.py udp client 192.168.1.5 -I -s 1400 -r 500m
 
 # Rate-limited to 1 Gbps
 python netperf.py udp client 192.168.1.5 -I -s 1400 -r 1g
+
+# Send from a fixed source port (useful for firewall rules or NAT pinholing)
+python netperf.py udp client 192.168.1.5 -I -s 1400 -B 6000
 ```
 
 ---
