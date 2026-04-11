@@ -1,85 +1,421 @@
 import socket
 import time
 import argparse
+import struct
+import zlib
 
-def run_server(host: str, port: int, bufsize: int, interval: int, as_client: bool):
-    if as_client:
-        # Connect to a remote TCP server
-        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        conn.connect((host, port))
-        print(f"Connected to upstream TCP server at {host}:{port}")
-    else:
-        # Act as a TCP server (listen for client)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind((host, port))
-        s.listen(1)
-        print(f"Server listening on {host}:{port}")
-        conn, addr = s.accept()
-        print(f"Connection from {addr}")
+# ---------------------------------------------------------------------------
+# Packet framing (shared by TCP and UDP)
+# ---------------------------------------------------------------------------
+# Each message is framed as:
+#   [4B length][4B seq][4B CRC32][payload]
+# where length = len(payload), CRC32 covers payload only.
+#
+# --integrity / -I flag enables framing on the sender and verification on the
+# receiver.  Without it, raw bytes are sent (legacy / max-throughput mode).
+# ---------------------------------------------------------------------------
 
+HEADER_FMT = "!III"          # length, seq, crc32  (all unsigned 32-bit)
+HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 12 bytes
+
+
+def encode_message(payload: bytes, seq: int) -> bytes:
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    header = struct.pack(HEADER_FMT, len(payload), seq, crc)
+    return header + payload
+
+
+def decode_header(raw: bytes):
+    """Return (length, seq, crc32) from the first HEADER_SIZE bytes."""
+    return struct.unpack(HEADER_FMT, raw[:HEADER_SIZE])
+
+
+def verify_message(payload: bytes, expected_crc: int) -> bool:
+    return (zlib.crc32(payload) & 0xFFFFFFFF) == expected_crc
+
+
+# ---------------------------------------------------------------------------
+# Reporting helpers
+# ---------------------------------------------------------------------------
+
+def kbps(byte_count: float, elapsed: float) -> float:
+    return (byte_count * 8) / (elapsed * 1e3) if elapsed > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# TCP
+# ---------------------------------------------------------------------------
+
+def _tcp_recv_session(conn, bufsize: int, interval: int, integrity: bool):
+    """Drain one TCP connection and print a session summary when it closes."""
     total_bytes = 0
+    corrupt = 0
     start_time = time.time()
     last_time = start_time
     last_bytes = 0
 
     with conn:
-        while True:
-            data = conn.recv(bufsize)
-            if not data:
-                break
-            total_bytes += len(data)
+        if integrity:
+            recv_buf = b""
+            while True:
+                while len(recv_buf) < HEADER_SIZE:
+                    chunk = conn.recv(bufsize)
+                    if not chunk:
+                        break
+                    recv_buf += chunk
+                if len(recv_buf) < HEADER_SIZE:
+                    break
 
-            # Report at intervals
-            now = time.time()
-            if now - last_time >= interval:
-                interval_bytes = total_bytes - last_bytes
-                mbps = (interval_bytes * 8) / ((now - last_time) * 1e3)
-                print(f"[{now - start_time:.1f}s] {mbps:.2f} Kbps")
-                last_time = now
-                last_bytes = total_bytes
+                length, seq, crc = decode_header(recv_buf)
+
+                needed = HEADER_SIZE + length
+                while len(recv_buf) < needed:
+                    chunk = conn.recv(bufsize)
+                    if not chunk:
+                        break
+                    recv_buf += chunk
+                if len(recv_buf) < needed:
+                    break
+
+                payload = recv_buf[HEADER_SIZE:needed]
+                recv_buf = recv_buf[needed:]
+
+                if not verify_message(payload, crc):
+                    corrupt += 1
+                    print(f"[TCP] WARNING: corrupt message seq={seq}")
+
+                total_bytes += length
+
+                now = time.time()
+                if now - last_time >= interval:
+                    interval_bytes = total_bytes - last_bytes
+                    print(f"[TCP][{now - start_time:.1f}s] "
+                          f"{kbps(interval_bytes, now - last_time):.2f} Kbps")
+                    last_time = now
+                    last_bytes = total_bytes
+        else:
+            while True:
+                data = conn.recv(bufsize)
+                if not data:
+                    break
+                total_bytes += len(data)
+
+                now = time.time()
+                if now - last_time >= interval:
+                    interval_bytes = total_bytes - last_bytes
+                    print(f"[TCP][{now - start_time:.1f}s] "
+                          f"{kbps(interval_bytes, now - last_time):.2f} Kbps")
+                    last_time = now
+                    last_bytes = total_bytes
 
     elapsed = time.time() - start_time
-    mbps = (total_bytes * 8) / (elapsed * 1e3)
-    print(f"Total: Received {total_bytes/1e3:.2f} KB in {elapsed:.2f} sec ({mbps:.2f} Kbps)")
+    print(f"[TCP] Session: {total_bytes/1e3:.2f} KB in {elapsed:.2f}s "
+          f"({kbps(total_bytes, elapsed):.2f} Kbps)"
+          + (f" | corrupt={corrupt}" if integrity else ""))
 
 
-def run_client(server: str, port: int, bufsize: int, duration: int):
-    
-    data = b"x" * bufsize
+def tcp_server(host: str, port: int, bufsize: int, interval: int,
+               as_client: bool, integrity: bool):
+    if as_client:
+        # Single outbound connection — behave as before
+        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        conn.connect((host, port))
+        print(f"[TCP] Connected to upstream server at {host}:{port}")
+        _tcp_recv_session(conn, bufsize, interval, integrity)
+        return
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, port))
+    s.listen(1)
+    print(f"[TCP] Listening on {host}:{port}  (Ctrl-C to quit)")
+
+    try:
+        while True:
+            conn, addr = s.accept()
+            print(f"[TCP] Connection from {addr}")
+            try:
+                _tcp_recv_session(conn, bufsize, interval, integrity)
+            except Exception as exc:
+                print(f"[TCP] Session error: {exc}")
+            print(f"[TCP] Waiting for next connection...")
+    except KeyboardInterrupt:
+        print("\n[TCP] Server stopped.")
+    finally:
+        s.close()
+
+
+def tcp_client(host: str, port: int, bufsize: int, duration: int,
+               integrity: bool):
+    payload = b"x" * bufsize
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((server, port))
-        print(f"Connected to {server}:{port}")
-
+        s.connect((host, port))
+        print(f"[TCP] Connected to {host}:{port}"
+              + (" (integrity on)" if integrity else ""))
         start_time = time.time()
         sent_bytes = 0
+        seq = 0
+        while time.time() - start_time < duration:
+            if integrity:
+                s.sendall(encode_message(payload, seq))
+                seq += 1
+            else:
+                s.sendall(payload)
+            sent_bytes += len(payload)
+
+    elapsed = time.time() - start_time
+    print(f"[TCP] Sent {sent_bytes/1e3:.2f} KB in {elapsed:.2f}s "
+          f"({kbps(sent_bytes, elapsed):.2f} Kbps)")
+
+
+# ---------------------------------------------------------------------------
+# UDP
+# ---------------------------------------------------------------------------
+
+def udp_server(host: str, port: int, bufsize: int, interval: int,
+               integrity: bool):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Request a large kernel receive buffer to absorb bursts.
+    target_rcvbuf = 64 * 1024 * 1024
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, target_rcvbuf)
+    actual_rcvbuf = s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    if actual_rcvbuf < target_rcvbuf:
+        print(f"[UDP] WARNING: SO_RCVBUF is {actual_rcvbuf // 1024} KB "
+              f"(wanted {target_rcvbuf // 1024} KB). "
+              f"Raise net.core.rmem_max to reduce kernel-level drops.")
+
+    s.bind((host, port))
+    s.settimeout(5.0)
+    print(f"[UDP] Listening on {host}:{port}"
+          + (" (integrity on)" if integrity else "")
+          + "  (Ctrl-C to quit)")
+
+    def reset_session():
+        return dict(total_bytes=0, corrupt=0, expected_seq=0,
+                    out_of_order=0, lost=0, pkt_count=0,
+                    start_time=None, last_time=None, last_bytes=0)
+
+    def print_summary(ss):
+        if ss["start_time"] is None:
+            return
+        elapsed = time.time() - ss["start_time"]
+        print(f"[UDP] Session: {ss['total_bytes']/1e3:.2f} KB in {elapsed:.2f}s "
+              f"({kbps(ss['total_bytes'], elapsed):.2f} Kbps) | pkts={ss['pkt_count']}"
+              + (f" lost={ss['lost']} ooo={ss['out_of_order']} corrupt={ss['corrupt']}"
+                 if integrity else ""))
+
+    ss = reset_session()
+
+    try:
+        while True:
+            try:
+                data, addr = s.recvfrom(bufsize + HEADER_SIZE + 64)
+            except socket.timeout:
+                if ss["start_time"] is not None:
+                    # Activity was happening — print report and reset for next session
+                    print_summary(ss)
+                    ss = reset_session()
+                    print(f"[UDP] Idle — waiting for next session...")
+                # else: still idle before first packet, just keep waiting
+                continue
+
+            now = time.time()
+
+            if ss["start_time"] is None:
+                ss["start_time"] = now
+                ss["last_time"] = now
+                print(f"[UDP] First packet from {addr}")
+
+            ss["pkt_count"] += 1
+
+            if integrity:
+                if len(data) < HEADER_SIZE:
+                    ss["corrupt"] += 1
+                    continue
+
+                length, seq, crc = decode_header(data)
+                payload = data[HEADER_SIZE:HEADER_SIZE + length]
+
+                if len(payload) != length:
+                    ss["corrupt"] += 1
+                    continue
+
+                if not verify_message(payload, crc):
+                    ss["corrupt"] += 1
+                    print(f"[UDP] WARNING: corrupt packet seq={seq}")
+                    continue
+
+                if seq < ss["expected_seq"]:
+                    ss["out_of_order"] += 1
+                elif seq > ss["expected_seq"]:
+                    ss["lost"] += seq - ss["expected_seq"]
+                    ss["expected_seq"] = seq + 1
+                else:
+                    ss["expected_seq"] += 1
+
+                ss["total_bytes"] += length
+            else:
+                ss["total_bytes"] += len(data)
+
+            if now - ss["last_time"] >= interval:
+                interval_bytes = ss["total_bytes"] - ss["last_bytes"]
+                print(f"[UDP][{now - ss['start_time']:.1f}s] "
+                      f"{kbps(interval_bytes, now - ss['last_time']):.2f} Kbps"
+                      + (f" | lost={ss['lost']} ooo={ss['out_of_order']} corrupt={ss['corrupt']}"
+                         if integrity else ""))
+                ss["last_time"] = now
+                ss["last_bytes"] = ss["total_bytes"]
+
+    except KeyboardInterrupt:
+        print("\n[UDP] Server stopped.")
+        print_summary(ss)
+    finally:
+        s.close()
+
+
+def udp_client(host: str, port: int, bufsize: int, duration: int,
+               integrity: bool, rate_kbps: float = 0):
+    """Send UDP datagrams.
+
+    rate_kbps: target send rate in Kbps (0 = unlimited).  The pacing is
+    done by tracking a token budget; no sleep is inserted when we're already
+    behind target, so the actual rate can be slightly below target on slow
+    systems but will never exceed it on average.
+    """
+    payload = b"x" * bufsize
+    # bytes per second budget (0 = unlimited)
+    rate_bps = (rate_kbps * 1e3) / 8 if rate_kbps > 0 else 0
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        print(f"[UDP] Sending to {host}:{port}"
+              + (" (integrity on)" if integrity else "")
+              + (f" @ {rate_kbps:.0f} Kbps" if rate_kbps > 0 else " (unlimited)"))
+        start_time = time.time()
+        sent_bytes = 0
+        seq = 0
+        next_send_time = start_time  # for pacing
 
         while time.time() - start_time < duration:
-            s.sendall(data)
-            sent_bytes += len(data)
+            # Pacing: if we have a rate limit, wait until the token is due
+            if rate_bps > 0:
+                now = time.time()
+                if now < next_send_time:
+                    time.sleep(next_send_time - now)
+                dgram_size = len(payload) + (HEADER_SIZE if integrity else 0)
+                next_send_time += dgram_size / rate_bps
 
-        elapsed = time.time() - start_time
-        mbps = (sent_bytes * 8) / (elapsed * 1e3)
-        print(f"Sent {sent_bytes/1e3:.2f} KB in {elapsed:.2f} sec ({mbps:.2f} Kbps)")
-        
+            if integrity:
+                dgram = encode_message(payload, seq)
+                s.sendto(dgram, (host, port))
+                seq += 1
+            else:
+                s.sendto(payload, (host, port))
+                seq += 1
+            sent_bytes += len(payload)
+
+    elapsed = time.time() - start_time
+    print(f"[UDP] Sent {sent_bytes/1e3:.2f} KB in {elapsed:.2f}s "
+          f"({kbps(sent_bytes, elapsed):.2f} Kbps) | pkts={seq}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def add_common_server_args(p):
+    p.add_argument("--host", default="0.0.0.0",
+                   help="Bind address (default: 0.0.0.0)")
+    p.add_argument("-p", "--port", type=int, default=5001,
+                   help="Port (default: 5001)")
+    p.add_argument("-b", "--bufsize", type=int, default=64 * 1024,
+                   help="Buffer / chunk size in bytes (default: 65536)")
+    p.add_argument("-i", "--interval", type=int, default=1,
+                   help="Reporting interval in seconds (default: 1)")
+    p.add_argument("-I", "--integrity", action="store_true",
+                   help="Enable framing: length prefix + CRC32 per message")
+
+
+def add_common_client_args(p):
+    p.add_argument("host", help="Server hostname or IP")
+    p.add_argument("-p", "--port", type=int, default=5001,
+                   help="Port (default: 5001)")
+    p.add_argument("-b", "--bufsize", type=int, default=64 * 1024,
+                   help="Payload size per send in bytes (default: 65536)")
+    p.add_argument("-t", "--time", type=int, default=10,
+                   help="Test duration in seconds (default: 10)")
+    p.add_argument("-I", "--integrity", action="store_true",
+                   help="Enable framing: length prefix + CRC32 per message")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Mini iperf-like TCP test tool")
-    parser.add_argument("-s", "--server", metavar="HOST", default="0.0.0.0", help="Run in server mode")
-    parser.add_argument("-a", "--as_client", action="store_true", help="Connect as a client to the tcp address")
-    parser.add_argument("-c", "--client", metavar="HOST", help="Run in client mode, connect to HOST")
-    parser.add_argument("-p", "--port", type=int, default=5001, help="Port number (default: 5001)")
-    parser.add_argument("-t", "--time", type=int, default=10, help="Duration of test in seconds (client only)")
-    parser.add_argument("-b", "--bufsize", type=int, default=64*1024, help="Buffer size in bytes (default: 65536)")
-    parser.add_argument("-i", "--interval", type=int, default=1, help="Interval in seconds for server updates (default: 1)")
+    parser = argparse.ArgumentParser(
+        description="Mini iperf-like tool — TCP & UDP throughput tester",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # TCP server
+  %(prog)s tcp server
+
+  # TCP client sending for 10s
+  %(prog)s tcp client 192.168.1.5
+
+  # UDP server with integrity checking
+  %(prog)s udp server -I
+
+  # UDP client with integrity checking, 30s, 8 KB datagrams
+  %(prog)s udp client 192.168.1.5 -I -t 30 -b 8192
+""")
+
+    sub = parser.add_subparsers(dest="proto", required=True,
+                                metavar="PROTOCOL")
+
+    # ---- TCP ----
+    tcp_p = sub.add_parser("tcp", help="TCP mode")
+    tcp_sub = tcp_p.add_subparsers(dest="role", required=True,
+                                   metavar="ROLE")
+
+    tcp_srv = tcp_sub.add_parser("server", help="TCP server (receiver)")
+    add_common_server_args(tcp_srv)
+    tcp_srv.add_argument("-a", "--as-client", action="store_true",
+                         help="Connect outward to a remote TCP server "
+                              "instead of listening")
+
+    tcp_cli = tcp_sub.add_parser("client", help="TCP client (sender)")
+    add_common_client_args(tcp_cli)
+
+    # ---- UDP ----
+    udp_p = sub.add_parser("udp", help="UDP mode")
+    udp_sub = udp_p.add_subparsers(dest="role", required=True,
+                                   metavar="ROLE")
+
+    udp_srv = udp_sub.add_parser("server", help="UDP server (receiver)")
+    add_common_server_args(udp_srv)
+
+    udp_cli = udp_sub.add_parser("client", help="UDP client (sender)")
+    add_common_client_args(udp_cli)
+    udp_cli.add_argument("-r", "--rate", type=float, default=0,
+                         metavar="KBPS",
+                         help="Target send rate in Kbps (default: unlimited). "
+                              "Use this to avoid flooding the receiver's "
+                              "kernel buffer and causing false packet loss.")
 
     args = parser.parse_args()
 
-    if args.server:
-        run_server(args.server, args.port, args.bufsize, args.interval, args.as_client)
-    elif args.client:
-        run_client(args.client, args.port, args.bufsize, args.time)
-    else:
-        parser.print_help()
+    if args.proto == "tcp":
+        if args.role == "server":
+            tcp_server(args.host, args.port, args.bufsize, args.interval,
+                       args.as_client, args.integrity)
+        else:
+            tcp_client(args.host, args.port, args.bufsize, args.time,
+                       args.integrity)
+    else:  # udp
+        if args.role == "server":
+            udp_server(args.host, args.port, args.bufsize, args.interval,
+                       args.integrity)
+        else:
+            udp_client(args.host, args.port, args.bufsize, args.time,
+                       args.integrity, args.rate)
 
 
 if __name__ == "__main__":
